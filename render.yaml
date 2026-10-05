@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: app2
+    runtime: python
+    plan: free
+    rootDir: dossier
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: FORM_URL
+        sync: false
+      - key: ACCESS_CODES_JSON
+        sync: false

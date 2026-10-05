@@ -1,246 +1,168 @@
 import hmac
-import tkinter as tk
-import webbrowser
-from pathlib import Path
-from tkinter import messagebox
+import json
+import os
+from typing import TypeGuard, cast
 from urllib.parse import urlsplit
-from zipfile import BadZipFile
 
-from openpyxl import Workbook, load_workbook
-from openpyxl.utils.exceptions import InvalidFileException
+from flask import Flask, Response, redirect, render_template_string, request
 
 
-APP_DIR = Path(__file__).resolve().parent
-ACCESS_FILE = APP_DIR / "utilisateurs_autorises.xlsx"
-FORM_URL_FILE = APP_DIR / "lien_formulaire.txt"
-ACCESS_HEADERS = ("Identifiant", "Code d'accès")
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 8 * 1024
+
+PAGE = """<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bienvenue</title>
+  <style>
+    :root { color-scheme: light; font-family: "Segoe UI", Arial, sans-serif; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; padding: 18px;
+      display: grid; place-items: center; background: #f1f3f6; color: #202b38;
+    }
+    main {
+      width: min(100%, 560px); padding: 42px 54px; background: #fff;
+      border-radius: 4px; box-shadow: 0 2px 12px #202b3810;
+    }
+    h1 { margin: 0; font-size: 2.2rem; }
+    .subtitle { margin: 12px 0 28px; color: #748398; font-size: 1.05rem; }
+    .notice {
+      margin-bottom: 24px; padding: 12px; background: #fff4e5;
+      color: #704b16; font-size: .9rem; line-height: 1.5;
+    }
+    label { display: block; margin: 0 0 8px; font-size: .95rem; }
+    input {
+      width: 100%; min-height: 52px; margin-bottom: 20px; padding: 10px;
+      border: 1px solid #d5d9de; border-radius: 2px; font: inherit;
+    }
+    input:focus { outline: 2px solid #7892ad; outline-offset: 1px; }
+    button {
+      width: 100%; min-height: 42px; border: 1px solid #aaa; background: #fff;
+      color: #d64e55; font: inherit; cursor: pointer;
+    }
+    button:hover { background: #fff5f5; }
+    .error { margin: 0 0 18px; color: #a52228; }
+    @media (max-width: 520px) { main { padding: 32px 24px; } }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Bienvenue</h1>
+    <p class="subtitle">Connectez-vous à votre espace</p>
+    <p class="notice">
+      Utilisez uniquement votre identifiant et votre code d'accès dédié.
+      Ne saisissez pas le mot de passe de votre compte Microsoft ou d'un autre service.
+      Le code sert uniquement à vérifier l'accès et n'est pas conservé.
+    </p>
+    {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+    <form method="post" action="{{ url_for('login') }}" autocomplete="off">
+      <label for="identifier">Identifiant</label>
+      <input id="identifier" name="identifier" type="text" required maxlength="200"
+             autocomplete="username">
+      <label for="access_code">Code d'accès</label>
+      <input id="access_code" name="access_code" type="password" required maxlength="200"
+             autocomplete="off">
+      <button type="submit">CONNEXION</button>
+    </form>
+  </main>
+</body>
+</html>
+"""
 
 
-def create_access_template(path: Path) -> None:
-    workbook = Workbook()
-    sheet = workbook.create_sheet("Acces")
-    workbook.remove(workbook.worksheets[0])
-    sheet.append(ACCESS_HEADERS)
-    sheet.freeze_panes = "A2"
-    sheet.column_dimensions["A"].width = 28
-    sheet.column_dimensions["B"].width = 28
-    for row in range(2, 1002):
-        sheet.cell(row=row, column=1).number_format = "@"
-        sheet.cell(row=row, column=2).number_format = "@"
-    workbook.save(path)
-    workbook.close()
+class ConfigurationError(ValueError):
+    pass
 
 
-def has_authorized_access(path: Path, identifier: str, access_code: str) -> bool:
-    workbook = load_workbook(path, read_only=True, data_only=True)
-    try:
-        if "Acces" not in workbook.sheetnames:
-            raise ValueError("L'onglet « Acces » est introuvable dans le fichier Excel.")
-
-        sheet = workbook["Acces"]
-        headers = tuple(sheet.cell(row=1, column=column).value for column in (1, 2))
-        if headers != ACCESS_HEADERS:
-            raise ValueError(
-                "Les deux premières cellules de la ligne 1 doivent être : "
-                "Identifiant et Code d'accès."
-            )
-
-        normalized_identifier = identifier.strip().casefold()
-        normalized_code = access_code.strip()
-        for stored_identifier, stored_code in sheet.iter_rows(
-            min_row=2, max_col=2, values_only=True
-        ):
-            if stored_identifier is None or stored_code is None:
-                continue
-            if (
-                str(stored_identifier).strip().casefold() == normalized_identifier
-                and hmac.compare_digest(
-                    str(stored_code).strip().encode("utf-8"),
-                    normalized_code.encode("utf-8"),
-                )
-            ):
-                return True
+def is_string_mapping(value: object) -> TypeGuard[dict[str, str]]:
+    if not isinstance(value, dict):
         return False
-    finally:
-        workbook.close()
+    entries = cast(dict[object, object], value)
+    for key, item in entries.items():
+        if not isinstance(key, str) or not isinstance(item, str):
+            return False
+    return True
 
 
-def read_form_url(path: Path) -> str:
-    url = path.read_text(encoding="utf-8").strip()
-    parsed_url = urlsplit(url)
+def read_configuration() -> tuple[dict[str, str], str]:
+    raw_codes = os.environ.get("ACCESS_CODES_JSON", "")
+    try:
+        parsed_codes: object = json.loads(raw_codes)
+    except json.JSONDecodeError as error:
+        raise ConfigurationError(
+            "ACCESS_CODES_JSON must be a JSON object mapping identifiers to access codes."
+        ) from error
+
+    if not is_string_mapping(parsed_codes) or not parsed_codes:
+        raise ConfigurationError("ACCESS_CODES_JSON must contain at least one user.")
+
+    normalized_codes: dict[str, str] = {}
+    for identifier, access_code in parsed_codes.items():
+        if not identifier.strip() or not access_code.strip():
+            raise ConfigurationError(
+                "Every access-code entry must have a non-empty string identifier and code."
+            )
+        normalized_identifier = identifier.strip().casefold()
+        if normalized_identifier in normalized_codes:
+            raise ConfigurationError("User identifiers must be unique, ignoring case.")
+        normalized_codes[normalized_identifier] = access_code.strip()
+
+    form_url = os.environ.get("FORM_URL", "").strip()
+    parsed_url = urlsplit(form_url)
     if parsed_url.scheme != "https" or not parsed_url.hostname:
-        raise ValueError(
-            "Le fichier lien_formulaire.txt doit contenir une URL complète "
-            "commençant par https://."
+        raise ConfigurationError("FORM_URL must be a complete HTTPS URL.")
+
+    return normalized_codes, form_url
+
+
+def render_page(error: str | None = None, status: int = 200):
+    return render_template_string(PAGE, error=error), status
+
+
+@app.after_request
+def add_security_headers(response: Response) -> Response:
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'none'; style-src 'unsafe-inline'; "
+        "form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+    )
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    return response
+
+
+@app.get("/")
+def index():
+    return render_page()
+
+
+@app.post("/login")
+def login():
+    identifier = request.form.get("identifier", "").strip()
+    access_code = request.form.get("access_code", "").strip()
+    if not identifier or not access_code:
+        return render_page("Saisissez votre identifiant et votre code d'accès.", 400)
+
+    try:
+        authorized_codes, form_url = read_configuration()
+    except ConfigurationError:
+        app.logger.exception("The access-code or form-link configuration is invalid.")
+        return render_page(
+            "Le service n'est pas configuré correctement. Réessayez plus tard.", 503
         )
-    return url
 
+    configured_code = authorized_codes.get(identifier.casefold())
+    if configured_code is None or not hmac.compare_digest(
+        configured_code.encode("utf-8"), access_code.encode("utf-8")
+    ):
+        return render_page("Identifiant ou code d'accès invalide.", 403)
 
-class LoginMockup(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("Bienvenue")
-        self.geometry("620x700")
-        self.minsize(460, 620)
-        self.configure(bg="#f1f3f6")
-
-        if not ACCESS_FILE.exists():
-            create_access_template(ACCESS_FILE)
-
-        card = tk.Frame(self, bg="white", padx=54, pady=42)
-        card.pack(fill="both", expand=True, padx=18, pady=18)
-
-        tk.Label(
-            card,
-            text="Bienvenue",
-            bg="white",
-            fg="#202b38",
-            font=("Segoe UI", 27, "bold"),
-            anchor="w",
-        ).pack(fill="x")
-
-        tk.Label(
-            card,
-            text="Connectez-vous à votre espace",
-            bg="white",
-            fg="#748398",
-            font=("Segoe UI", 13),
-            anchor="w",
-        ).pack(fill="x", pady=(12, 24))
-
-        tk.Label(
-            card,
-            text=(
-                "Utilisez l'identifiant et le code d'accès dédiés inscrits dans "
-                "utilisateurs_autorises.xlsx. N'utilisez pas votre mot de passe "
-                "de compte."
-            ),
-            bg="#fff4e5",
-            fg="#704b16",
-            font=("Segoe UI", 9),
-            justify="left",
-            wraplength=440,
-            padx=12,
-            pady=10,
-        ).pack(fill="x", pady=(0, 24))
-
-        tk.Label(
-            card, text="Identifiant", bg="white", fg="#202b38", font=("Segoe UI", 11)
-        ).pack(fill="x", pady=(0, 8))
-        self.identifier = tk.Entry(
-            card,
-            font=("Segoe UI", 14),
-            relief="solid",
-            bd=1,
-            highlightthickness=1,
-            highlightbackground="#d5d9de",
-            highlightcolor="#7892ad",
-        )
-        self.identifier.pack(fill="x", ipady=9, pady=(0, 22))
-
-        tk.Label(
-            card,
-            text="Code d'accès",
-            bg="white",
-            fg="#202b38",
-            font=("Segoe UI", 11),
-        ).pack(fill="x", pady=(0, 8))
-        self.access_code = tk.Entry(
-            card,
-            font=("Segoe UI", 14),
-            show="•",
-            relief="solid",
-            bd=1,
-            highlightthickness=1,
-            highlightbackground="#d5d9de",
-            highlightcolor="#7892ad",
-        )
-        self.access_code.pack(fill="x", ipady=9)
-
-        self.show_code = tk.BooleanVar(value=False)
-        tk.Checkbutton(
-            card,
-            text="Afficher le code d'accès",
-            variable=self.show_code,
-            command=self.toggle_code,
-            bg="white",
-            activebackground="white",
-            fg="#202b38",
-            font=("Segoe UI", 10),
-            anchor="w",
-        ).pack(fill="x", pady=(10, 28))
-
-        tk.Button(
-            card,
-            text="CONNEXION",
-            command=self.open_form,
-            bg="white",
-            fg="#e45d63",
-            activebackground="#fff5f5",
-            activeforeground="#cf454b",
-            font=("Segoe UI", 13),
-            relief="solid",
-            bd=1,
-            cursor="hand2",
-        ).pack(fill="x", ipady=4)
-
-    def toggle_code(self):
-        self.access_code.configure(show="" if self.show_code.get() else "•")
-
-    def open_form(self):
-        identifier = self.identifier.get().strip()
-        access_code = self.access_code.get()
-        self.identifier.delete(0, tk.END)
-        self.access_code.delete(0, tk.END)
-
-        if not identifier or not access_code.strip():
-            messagebox.showwarning(
-                "Champs requis",
-                "Saisissez votre identifiant et votre code d'accès.",
-                parent=self,
-            )
-            return
-
-        try:
-            authorized = has_authorized_access(
-                ACCESS_FILE, identifier, access_code
-            )
-        except (OSError, BadZipFile, InvalidFileException, ValueError) as error:
-            messagebox.showerror("Fichier Excel invalide", str(error), parent=self)
-            return
-
-        if not authorized:
-            messagebox.showerror(
-                "Accès refusé",
-                "Cet identifiant et ce code d'accès ne figurent pas dans le fichier "
-                "des utilisateurs autorisés.",
-                parent=self,
-            )
-            return
-
-        try:
-            form_url = read_form_url(FORM_URL_FILE)
-        except (OSError, ValueError) as error:
-            messagebox.showerror("Lien du formulaire invalide", str(error), parent=self)
-            return
-
-        try:
-            opened = webbrowser.open_new_tab(form_url)
-        except webbrowser.Error as error:
-            messagebox.showerror(
-                "Ouverture impossible",
-                f"Le formulaire n'a pas pu être ouvert : {error}",
-                parent=self,
-            )
-            return
-
-        if not opened:
-            messagebox.showerror(
-                "Ouverture impossible",
-                "Le navigateur n'a pas pu ouvrir le formulaire.",
-                parent=self,
-            )
+    return redirect(form_url, code=303)
 
 
 if __name__ == "__main__":
-    LoginMockup().mainloop()
+    app.run(host="127.0.0.1", port=5000, debug=False)
