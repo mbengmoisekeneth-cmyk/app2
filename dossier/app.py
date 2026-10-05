@@ -58,7 +58,7 @@ PAGE = """<!doctype html>
       Le code sert uniquement à vérifier l'accès et n'est pas conservé.
     </p>
     {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
-    <form method="post" action="{{ url_for('login') }}" autocomplete="off">
+    <form method="post" action="" autocomplete="off">
       <label for="identifier">Identifiant</label>
       <input id="identifier" name="identifier" type="text" required maxlength="200"
              autocomplete="username">
@@ -141,6 +141,7 @@ def index():
 
 
 @app.post("/login")
+@app.post("/")
 def login():
     identifier = request.form.get("identifier", "").strip()
     access_code = request.form.get("access_code", "").strip()
